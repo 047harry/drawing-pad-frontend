@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Collaborative Drawing Pad</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script>
+        const { useState, useRef, useEffect } = React;
+        
+        // IMPORTANT: Replace with your Render backend URL
+        const SERVER_URL = 'https://drawing-pad-backend.onrender.com';
+        
+        function CollaborativeDrawingPad() {
+            const [roomId, setRoomId] = useState('');
+            const [isConnected, setIsConnected] = useState(false);
+            const [inputRoomId, setInputRoomId] = useState('');
+            const [drawing, setDrawing] = useState(false);
+            const [color, setColor] = useState('#000000');
+            const [lineWidth, setLineWidth] = useState(3);
+            const [tool, setTool] = useState('pen');
+            const [copied, setCopied] = useState(false);
+            const [connectedUsers, setConnectedUsers] = useState(1);
+            const [error, setError] = useState('');
+            const [serverConnected, setServerConnected] = useState(false);
+            
+            const canvasRef = useRef(null);
+            const socketRef = useRef(null);
+            const drawHistoryRef = useRef([]);
+            const lastPosRef = useRef({ x: 0, y: 0 });
+            const reconnectTimeoutRef = useRef(null);
+
+            const generateRoomId = () => {
+                return Math.random().toString(36).substring(2, 10).toUpperCase();
+            };
+
+            useEffect(() => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                
+                const ctx = canvas.getContext('2d');
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                
+                const resizeCanvas = () => {
+                    const rect = canvas.getBoundingClientRect();
+                    const oldWidth = canvas.width;
+                    const oldHeight = canvas.height;
+                    
+                    canvas.width = rect.width;
+                    canvas.height = rect.height;
+                    
+                    if (oldWidth !== canvas.width || oldHeight !== canvas.height) {
+                        redrawCanvas();
+                    }
+                };
+                
+                resizeCanvas();
+                window.addEventListener('resize', resizeCanvas);
+                
+                return () => window.removeEventListener('resize', resizeCanvas);
+            }, []);
+
+            const redrawCanvas = () => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                
+                const ctx = canvas.getContext('2d');
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                
+                drawHistoryRef.current.forEach(action => {
+                    if (action.type === 'clear') {
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    } else {
+                        ctx.strokeStyle = action.color;
+                        ctx.lineWidth = action.lineWidth;
+                        ctx.globalCompositeOperation = action.tool === 'eraser' ? 'destination-out' : 'source-over';
+                        
+                        ctx.beginPath();
+                        ctx.moveTo(action.startX, action.startY);
+                        ctx.lineTo(action.endX, action.endY);
+                        ctx.stroke();
+                    }
+                });
+                
+                ctx.globalCompositeOperation = 'source-over';
+            };
+
+            const connectToRoom = (id, isCreating = false) => {
+                if (!isCreating && (!id || id.length < 6)) {
+                    setError('Invalid Room ID. Please enter a valid room code.');
+                    return false;
+                }
+                
+                setError('');
+
+                let wsUrl = SERVER_URL.replace('https://', 'wss://').replace('http://', 'ws://');
+
+                try {
+                    const ws = new WebSocket(wsUrl);
+
+                    ws.onopen = () => {
+                        console.log('Connected to server');
+                        setServerConnected(true);
+                        
+                        ws.send(JSON.stringify({
+                            type: 'joinRoom',
+                            roomId: id,
+                            isCreating
+                        }));
+                        
+                        setRoomId(id);
+                        setIsConnected(true);
+                    };
+
+                    ws.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            
+                            switch(data.type) {
+                                case 'drawHistory':
+                                    console.log('Received drawing history:', data.history.length, 'actions');
+                                    drawHistoryRef.current = data.history;
+                                    redrawCanvas();
+                                    break;
+                                    
+                                case 'draw':
+                                    drawHistoryRef.current.push(data);
+                                    redrawCanvas();
+                                    break;
+                                    
+                                case 'clear':
+                                    drawHistoryRef.current = [];
+                                    redrawCanvas();
+                                    break;
+                                    
+                                case 'userCount':
+                                    setConnectedUsers(data.count);
+                                    break;
+                            }
+                        } catch (err) {
+                            console.error('Error parsing message:', err);
+                        }
+                    };
+
+                    ws.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        setError('Connection error. Please check if the server is running.');
+                        setServerConnected(false);
+                    };
+
+                    ws.onclose = () => {
+                        console.log('Disconnected from server');
+                        setServerConnected(false);
+                        
+                        if (isConnected) {
+                            reconnectTimeoutRef.current = setTimeout(() => {
+                                console.log('Attempting to reconnect...');
+                                connectToRoom(id, false);
+                            }, 3000);
+                        }
+                    };
+
+                    socketRef.current = ws;
+                    return true;
+                } catch (err) {
+                    console.error('Error creating WebSocket:', err);
+                    setError('Could not connect to server. Please check the server URL.');
+                    return false;
+                }
+            };
+
+            const createRoom = () => {
+                const newRoomId = generateRoomId();
+                connectToRoom(newRoomId, true);
+            };
+
+            const joinRoom = () => {
+                if (inputRoomId.trim()) {
+                    connectToRoom(inputRoomId.toUpperCase());
+                }
+            };
+
+            const copyRoomId = () => {
+                navigator.clipboard.writeText(roomId);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+            };
+
+            const clearCanvas = () => {
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                drawHistoryRef.current = [];
+                
+                if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+                    socketRef.current.send(JSON.stringify({ type: 'clear' }));
+                }
+            };
+
+            const startDrawing = (e) => {
+                setDrawing(true);
+                const canvas = canvasRef.current;
+                const rect = canvas.getBoundingClientRect();
+                const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+                const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+                
+                lastPosRef.current = { x, y };
+                
+                const ctx = canvas.getContext('2d');
+                ctx.strokeStyle = tool === 'eraser' ? '#FFFFFF' : color;
+                ctx.lineWidth = lineWidth;
+                ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
+                ctx.beginPath();
+                ctx.moveTo(x, y);
+            };
+
+            const draw = (e) => {
+                if (!drawing) return;
+                
+                const canvas = canvasRef.current;
+                const rect = canvas.getBoundingClientRect();
+                const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+                const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+                
+                const ctx = canvas.getContext('2d');
+                ctx.strokeStyle = tool === 'eraser' ? '#FFFFFF' : color;
+                ctx.lineWidth = lineWidth;
+                ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
+                
+                ctx.lineTo(x, y);
+                ctx.stroke();
+                
+                const drawAction = {
+                    type: 'draw',
+                    startX: lastPosRef.current.x,
+                    startY: lastPosRef.current.y,
+                    endX: x,
+                    endY: y,
+                    color: tool === 'eraser' ? '#FFFFFF' : color,
+                    lineWidth,
+                    tool
+                };
+                
+                lastPosRef.current = { x, y };
+                
+                drawHistoryRef.current.push(drawAction);
+                
+                if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+                    socketRef.current.send(JSON.stringify(drawAction));
+                }
+            };
+
+            const stopDrawing = () => {
+                setDrawing(false);
+            };
+
+            useEffect(() => {
+                return () => {
+                    if (reconnectTimeoutRef.current) {
+                        clearTimeout(reconnectTimeoutRef.current);
+                    }
+                    if (socketRef.current) {
+                        socketRef.current.close();
+                    }
+                };
+            }, []);
+
+            if (!isConnected) {
+                return React.createElement('div', {className: 'min-h-screen bg-gradient-to-br from-purple-50 to-blue-50 flex items-center justify-center p-4'},
+                    React.createElement('div', {className: 'bg-white rounded-2xl shadow-xl p-8 max-w-md w-full'},
+                        React.createElement('div', {className: 'text-center mb-8'},
+                            React.createElement('div', {className: 'bg-purple-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4'},
+                                React.createElement('svg', {className: 'w-8 h-8 text-purple-600', fill: 'none', stroke: 'currentColor', viewBox: '0 0 24 24'},
+                                    React.createElement('path', {strokeLinecap: 'round', strokeLinejoin: 'round', strokeWidth: 2, d: 'M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z'})
+                                )
+                            ),
+                            React.createElement('h1', {className: 'text-3xl font-bold text-gray-800 mb-2'}, 'Collaborative Drawing Pad'),
+                            React.createElement('p', {className: 'text-gray-600'}, 'Draw together in real-time with friends across the world')
+                        ),
+                        React.createElement('div', {className: 'space-y-4'},
+                            React.createElement('button', {onClick: createRoom, className: 'w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors duration-200'}, 'Create New Room'),
+                            React.createElement('div', {className: 'relative'},
+                                React.createElement('div', {className: 'absolute inset-0 flex items-center'},
+                                    React.createElement('div', {className: 'w-full border-t border-gray-300'})
+                                ),
+                                React.createElement('div', {className: 'relative flex justify-center text-sm'},
+                                    React.createElement('span', {className: 'px-2 bg-white text-gray-500'}, 'OR')
+                                )
+                            ),
+                            React.createElement('div', {className: 'space-y-3'},
+                                React.createElement('input', {
+                                    type: 'text',
+                                    placeholder: 'Enter Room ID',
+                                    value: inputRoomId,
+                                    onChange: (e) => {
+                                        setInputRoomId(e.target.value.toUpperCase());
+                                        setError('');
+                                    },
+                                    className: 'w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:border-purple-500 focus:outline-none transition-colors uppercase',
+                                    maxLength: 8
+                                }),
+                                error && React.createElement('div', {className: 'text-red-600 text-sm bg-red-50 px-3 py-2 rounded'}, error),
+                                React.createElement('button', {
+                                    onClick: joinRoom,
+                                    disabled: !inputRoomId.trim(),
+                                    className: 'w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-lg transition-colors duration-200'
+                                }, 'Join Room')
+                            )
+                        )
+                    )
+                );
+            }
+
+            return React.createElement('div', {className: 'h-screen flex flex-col bg-gray-50'},
+                React.createElement('div', {className: 'bg-white border-b border-gray-200 px-4 py-3'},
+                    React.createElement('div', {className: 'max-w-7xl mx-auto flex items-center justify-between flex-wrap gap-3'},
+                        React.createElement('div', {className: 'flex items-center gap-3'},
+                            React.createElement('div', {className: 'bg-purple-100 p-2 rounded-lg'},
+                                React.createElement('svg', {className: 'w-5 h-5 text-purple-600', fill: 'none', stroke: 'currentColor', viewBox: '0 0 24 24'},
+                                    React.createElement('path', {strokeLinecap: 'round', strokeLinejoin: 'round', strokeWidth: 2, d: 'M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z'})
+                                )
+                            ),
+                            React.createElement('div', {},
+                                React.createElement('div', {className: 'font-semibold text-gray-800'}, 'Room ID: ' + roomId),
+                                React.createElement('div', {className: 'flex items-center gap-3 text-sm'},
+                                    React.createElement('span', {className: 'text-gray-500'}, connectedUsers + ' user' + (connectedUsers > 1 ? 's' : '')),
+                                    React.createElement('span', {className: serverConnected ? 'text-green-600' : 'text-red-600'}, serverConnected ? 'Connected' : 'Disconnected')
+                                )
+                            )
+                        ),
+                        React.createElement('button', {onClick: copyRoomId, className: 'flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg transition-colors'},
+                            copied ? 'Copied!' : 'Share Room ID'
+                        )
+                    )
+                ),
+                React.createElement('div', {className: 'bg-white border-b border-gray-200 px-4 py-3'},
+                    React.createElement('div', {className: 'max-w-7xl mx-auto flex items-center gap-4 flex-wrap'},
+                        React.createElement('div', {className: 'flex gap-2'},
+                            React.createElement('button', {onClick: () => setTool('pen'), className: 'p-2 rounded-lg transition-colors ' + (tool === 'pen' ? 'bg-purple-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}, 'Pen'),
+                            React.createElement('button', {onClick: () => setTool('eraser'), className: 'p-2 rounded-lg transition-colors ' + (tool === 'eraser' ? 'bg-purple-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}, 'Eraser')
+                        ),
+                        React.createElement('div', {className: 'flex items-center gap-2'},
+                            React.createElement('label', {className: 'text-sm font-medium text-gray-700'}, 'Color:'),
+                            React.createElement('input', {type: 'color', value: color, onChange: (e) => setColor(e.target.value), className: 'w-10 h-10 rounded cursor-pointer'})
+                        ),
+                        React.createElement('div', {className: 'flex items-center gap-2'},
+                            React.createElement('label', {className: 'text-sm font-medium text-gray-700'}, 'Size:'),
+                            React.createElement('input', {type: 'range', min: '1', max: '20', value: lineWidth, onChange: (e) => setLineWidth(parseInt(e.target.value)), className: 'w-32'}),
+                            React.createElement('span', {className: 'text-sm text-gray-600 w-8'}, lineWidth + 'px')
+                        ),
+                        React.createElement('button', {onClick: clearCanvas, className: 'ml-auto bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg transition-colors'}, 'Clear')
+                    )
+                ),
+                React.createElement('div', {className: 'flex-1 p-4'},
+                    React.createElement('div', {className: 'max-w-7xl mx-auto h-full bg-white rounded-lg shadow-lg overflow-hidden'},
+                        React.createElement('canvas', {
+                            ref: canvasRef,
+                            onMouseDown: startDrawing,
+                            onMouseMove: draw,
+                            onMouseUp: stopDrawing,
+                            onMouseLeave: stopDrawing,
+                            className: 'w-full h-full cursor-crosshair'
+                        })
+                    )
+                )
+            );
+        }
+
+        ReactDOM.render(
+            React.createElement(CollaborativeDrawingPad),
+            document.getElementById('root')
+        );
+    </script>
+</body>
+</html>
